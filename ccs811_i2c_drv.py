@@ -1,17 +1,7 @@
 from typing import Optional, Union, Tuple, List, Any, ByteString
 import struct
 import RPi.GPIO as GPIO
-
-class CO2MeterWrapper:
-
-    def __init__(self, i2c) -> None:
-        self._i2c = i2c
-        self.init()
-
-    def init(self) -> None:
-        """Run the initialization commands."""
-        print("co2: initialized")
-
+import math as m
 
 class PinWrapper:
     def __init__(self, pin_id, mode=GPIO.OUT, value=0):
@@ -68,10 +58,17 @@ class I2CWrapper:
         if count == 0:
             raise RuntimeError("Zero byte reading is not implemented")
         elif count == 1:
-            data = pi.i2c_read_byte_data(self._i2c_device, addr)
+            
+            # for some reason single transaction read doesn't work properly
+            # might be speed issue
+            # data = self._pi.i2c_read_byte_data(self._i2c_device, addr)
+
+            # so have to use 2-transaction form
+            self._pi.i2c_write_device(self._i2c_device, struct.pack(">B", addr))
+            data = self._pi.i2c_read_byte(self._i2c_device)
             print(f"data={data:x}")
         else:
-            (bytes, data) = pi.i2c_read_i2c_block_data(self._i2c_device, addr, count)
+            (bytes, data) = self._pi.i2c_read_i2c_block_data(self._i2c_device, addr, count)
             if bytes < 0:
                 raise RuntimeError("Got error while reading")
             print(f"data={[hex(i) for i in data] if data else None}")
@@ -79,20 +76,36 @@ class I2CWrapper:
 
 
 class CO2MeterWrapper:
-    _SW_RESET_ADDR = 0xFF
-    _SW_RESET_VAL = b"\x11\xE5\x72\x8A"
+    SW_RESET_ADDR = 0xFF
+    SW_RESET_VAL = b"\x11\xE5\x72\x8A"
 
-    _HW_ID_ADDR = 0x20
-    _HW_ID_VAL = 0x81
+    HW_ID_ADDR = 0x20
+    HW_ID_VAL = 0x81
 
-    _STATUS_ADDR = 0x0
+    STATUS_ADDR = 0x0
+    STATUS_REG_FW_MODE_FIELD = (7,7)
+    STATUS_REG_APP_VALID_FIELD = (4,4)
+    STATUS_REG_DATA_READY_FIELD = (3,3)
+    STATUS_REG_ERROR_FIELD = (0,0)
 
-    _APP_START_ADDR = 0xF4
+    APP_START_ADDR = 0xF4
 
-    _MEAS_MODE_ADDR = 0x1
-    _MEAS_MODE_1SEC = 0x01 << 4
+    MEAS_MODE_ADDR = 0x1
+    MEAS_MODE_REG_DRIVE_MODE_FIELD = (6,4)
+    MEAS_MODE_REG_INT_DATARDY_FIELD = (3,3)
+    MEAS_MODE_REG_INT_THRESH_FIELD = (2,2)
+    DRIVE_MODE_1SEC = 0x01
 
-    _ALG_RESULT_DATA_ADDR = 0x2
+    ALG_RESULT_DATA_ADDR = 0x2
+
+    ERROR_ID_ADDR = 0xE0
+    ERROR_ID_REG_WRITE_REG_INVALID_FIELD = (0,0)
+    ERROR_ID_REG_READ_REG_INVALID_FIELD = (1,1)
+    ERROR_ID_REG_MEASMODE_INVALID_FIELD = (2,2)
+    ERROR_ID_REG_MAX_RESISTANCE_FIELD = (3,3)
+    ERROR_ID_REG_HEATER_FAULT_FIELD = (4,4)
+    ERROR_ID_REG_HEATER_SUPPLY_FIELD = (5,5)
+
     def __init__(self, i2c) -> None:
         self._i2c = i2c
         self.reset()
@@ -100,32 +113,77 @@ class CO2MeterWrapper:
     def reset(self) -> None:
         '''SW reset'''
         print(f"co2: SW RST")
-        self._i2c.write(self._SW_RESET_ADDR, self._SW_RESET_VAL)
+        self._i2c.write(self.SW_RESET_ADDR, self.SW_RESET_VAL)
         time.sleep(0.5)
 
     def check_devid(self) -> bool:
-        res = self._i2c.read(self._HW_ID_ADDR)
-        print(f"co2: Expected HW_ID={self._HW_ID_VAL}, received HW_ID={res}")
-        return res == self._HW_ID_VAL
+        res = self._i2c.read(self.HW_ID_ADDR)
+        print(f"co2: Expected HW_ID={self.HW_ID_VAL}, received HW_ID={res}")
+        return res == self.HW_ID_VAL
 
     def read_status(self) -> int:
-        res = self._i2c.read(self._STATUS_ADDR)
-        print(f"co2: FW_MODE={(res >> 7) & 0x1:x}, APP_VALID={(res >> 4) & 0x1:x}, DATA_READY={(res >> 3) & 0x1:x}, ERROR={res & 0x1:x}")
+        '''Returns status register value'''
+        res = self._i2c.read(self.STATUS_ADDR)
+        fw_mode = CO2MeterWrapper.get_field(res, self.STATUS_REG_FW_MODE_FIELD)
+        app_valid = CO2MeterWrapper.get_field(res, self.STATUS_REG_APP_VALID_FIELD)
+        data_ready = CO2MeterWrapper.get_field(res, self.STATUS_REG_DATA_READY_FIELD)
+        error = CO2MeterWrapper.get_field(res, self.STATUS_REG_ERROR_FIELD)
+        print(f"co2: FW_MODE={fw_mode:x}, APP_VALID={app_valid:x}, DATA_READY={data_ready:x}, ERROR={error:x}")
         return res
 
-    def set_app_mode(self):
-        self._i2c.write(self._APP_START_ADDR)
+    def check_errid(self) -> bool:
+        res = self._i2c.read(self.ERROR_ID_ADDR)
+        err_fields = [
+            ("write_reg_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_WRITE_REG_INVALID_FIELD)),
+            ("read_reg_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_READ_REG_INVALID_FIELD)),
+            ("measmode_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_MEASMODE_INVALID_FIELD)),
+            ("max_resistance", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_MAX_RESISTANCE_FIELD)),
+            ("heater_fault", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_HEATER_FAULT_FIELD)),
+            ("heater_supply", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_HEATER_SUPPLY_FIELD)),
+        ]
+        print("co2:", end="")
+        for name, val in err_fields:
+            print(f" {name}={val};", end="")
+        print()
+        return res == 0
 
-    def set_meas_mode(self, mode_byte: int):
-        print(f"co2: MEAS_MODE={mode_byte:x}")
+    def set_app_mode(self):
+        '''Writes application mode'''
+        self._i2c.write(self.APP_START_ADDR)
+        time.sleep(0.1)
+
+    def setmeas_mode(self, mode: int):
+        '''Writes measurement mode to register'''
+        meas_mode_regval = self._i2c.read(self.MEAS_MODE_ADDR)
+        meas_mode_regval = CO2MeterWrapper.set_field(meas_mode_regval, self.MEAS_MODE_REG_DRIVE_MODE_FIELD, mode)
+        print(f"co2: MEAS_MODE={mode:x}")
         # send byte to reg MEAS_MODE_ADDR
-        self._i2c.write(self._MEAS_MODE_ADDR, struct.pack(">B", mode_byte))
+        self._i2c.write(self.MEAS_MODE_ADDR, struct.pack(">B", meas_mode_regval))
+        time.sleep(0.5)
 
     def read_meas(self):
-        data = self._i2c.read(self._ALG_RESULT_DATA_ADDR, 4)
+        data = self._i2c.read(self.ALG_RESULT_DATA_ADDR, 4)
         eco2 = data[0] << 8 | data[1]
         tvoc = data[2] << 8 | data[3]
         return eco2, tvoc
+
+    @staticmethod
+    def get_field(regval:int, field: Tuple[int, int]) -> int:
+        ''' Returns register field value'''
+        mask = ((0x1 << (1 + field[0] - field[1])) - 1) << field[1]
+        return (regval & mask) >> field[1]
+
+    @staticmethod
+    def set_field(regval:int, field: Tuple[int, int], fieldval:int) -> int:
+        ''' Sets field value and return register value'''
+        width = 1 + field[0] - field[1]
+        if fieldval: assert((int(m.log2(fieldval)) + 1 <= width))
+        mask = ((0x1 << width) - 1) << field[1]
+        regval |= mask # set all ones in field
+        regval &= (fieldval << field[1]) & mask # copy zeros from fieldval
+        return regval
+
+
 
 if __name__ == "__main__":
     import time
@@ -146,19 +204,27 @@ if __name__ == "__main__":
 
         meter.check_devid()
         meter.read_status()
+        meter.check_errid()
         meter.set_app_mode()
+        
         status = meter.read_status()
-        fw_mode = (status >> 7) & 0x1
+
+        fw_mode = meter.get_field(status, meter.STATUS_REG_FW_MODE_FIELD)
         if not fw_mode:
             raise RuntimeError("wrong fw_mode:", fw_mode)
-        
-        meter.set_meas_mode(0x01 << 4)
+        if meter.get_field(status, meter.STATUS_REG_ERROR_FIELD):
+            meter.check_errid()
+            raise RuntimeError("got err bit")        
+
+        meter.setmeas_mode(meter.DRIVE_MODE_1SEC)
 
         while True:
-            time.sleep(0.5)
-            res = meter.read_status()
-            if (res >> 3) & 0x1:
-                print("Data is ready!")
+            time.sleep(1)
+            status = meter.read_status()
+            if meter.get_field(status, meter.STATUS_REG_ERROR_FIELD):
+                meter.check_errid()
+                raise RuntimeError("got err bit")
+            if meter.get_field(status, meter.STATUS_REG_DATA_READY_FIELD):
                 eco2, tvoc = meter.read_meas()
                 print(f"eco2={eco2}, tvoc={tvoc}")
 
