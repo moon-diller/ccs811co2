@@ -1,8 +1,12 @@
 from typing import Optional, Tuple, ByteString
-import struct
-import RPi.GPIO as GPIO
-import math as m
 from enum import Enum
+import struct
+
+import math as m
+import time
+
+import RPi.GPIO as GPIO
+
 
 class Logger:
     '''Logger with verbosity control'''
@@ -223,7 +227,6 @@ class CO2Meter:
 
 
 if __name__ == "__main__":
-    import time
     import pigpio
     
     GPIO.setmode(GPIO.BCM)
