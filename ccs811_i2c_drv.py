@@ -1,12 +1,55 @@
-from typing import Optional, Union, Tuple, List, Any, ByteString
+from typing import Optional, Tuple, ByteString
 import struct
 import RPi.GPIO as GPIO
 import math as m
+from enum import Enum
 
-class PinWrapper:
-    def __init__(self, pin_id, mode=GPIO.OUT, value=0):
+class Logger:
+    '''Logger with verbosity control'''
+    class Verbosity(Enum):
+        MIN = 1
+        MED = 2
+        MAX = 3
+
+    def __init__(self, prefix: str, verbosity: "Logger.Verbosity" = Verbosity.MAX) -> None:
+        '''Verbosity controls amount of messages to be printed. Higher verbosity => more messages.'''
+        self._verbosity = verbosity
+        self._prefix = prefix
+    
+    @property
+    def verbosity(self) -> "Logger.Verbosity":
+        """Return current verbosity"""
+        return self._verbosity
+
+    @verbosity.setter
+    def verbosity(self, verbosity: "Logger.Verbosity") -> None:
+        '''Changes logger min verbosity level'''
+        self._verbosity = verbosity
+
+    def info(self, *args, **kwargs) -> None:
+        '''Logging an info message. Minumum message verbosity => message is always printed.
+        Default message verbosity is MAX to limit amount of messages.'''
+        message_verbosity = kwargs.pop('verbosity', Logger.Verbosity.MAX)
+        if message_verbosity.value <= self._verbosity.value:
+            if kwargs.pop('no_prefix', False):
+                print(*args, **kwargs)
+            else:
+                print(f"{self._prefix} info: ", *args, **kwargs)
+
+    def warning(self, *args, **kwargs) -> None:
+        '''Logging a warning message'''
+        raise NotImplementedError("Please Implement this method")
+    
+    def fatal(self, *args, **kwargs) -> None:
+        '''Logging a fatal message'''
+        raise NotImplementedError("Please Implement this method")
+
+
+class OutPinWrapper:
+    '''Output GPIO pin'''
+    def __init__(self, pin_id, value=0):
         self._pin_id = pin_id
-        self._mode = mode
+        self._mode = GPIO.OUT
         GPIO.setup(self._pin_id, self._mode)
         self._value = value
     
@@ -20,27 +63,20 @@ class PinWrapper:
         self._value = val
         GPIO.output(self._pin_id, GPIO.HIGH if self._value else GPIO.LOW)
 
-class I2CWrapper:
 
-    # def __init__(self, i2c_bus, i2c_dev_addr):
-    #     self._pi = pigpio.pi()
-    #     self._i2c_device = pi.i2c_open(i2c_bus, i2c_dev_addr)
+class I2cDriver:
+    '''I2C interace high-level driver'''
 
-    def __init__(self, pi, i2c_device):
+    def __init__(self, pi, i2c_device, logger: Logger):
         self._pi = pi
         self._i2c_device = i2c_device
-
-    # def __enter__(self):
-    #     return self
-
-    # def __exit__(self, exc_type, exc_value, traceback):
-    #     self._pi.i2c_close(i2c_device_handler)
+        self._logger = logger
 
     def write(
-        self, addr: int, data: ByteString | None = None
+        self, addr: int, data: Optional[ByteString] = None
     ) -> None:
         '''Writes data to addr using I2C interface'''
-        print(f"i2c wr: addr={addr:x}, data={data}")
+        self._logger.info(f"wr: addr={addr:x}, data={data}")
         if data is None:
             self._pi.i2c_write_device(self._i2c_device, struct.pack(">B", addr))
         elif len(data) == 1:
@@ -49,11 +85,10 @@ class I2CWrapper:
             self._pi.i2c_write_byte_data(self._i2c_device, addr, data_byte)
         else:
             self._pi.i2c_write_i2c_block_data(self._i2c_device, addr, data)
-
-    
+  
     def read(self, addr: int, count: int = 1) -> ByteString:
         '''Reads data from addr using I2C interface'''
-        print(f"i2c rd: addr={addr:x},", end="")
+        self._logger.info(f"rd: addr={addr:x},", end="")
         data = None
         if count == 0:
             raise RuntimeError("Zero byte reading is not implemented")
@@ -66,16 +101,17 @@ class I2CWrapper:
             # so have to use 2-transaction form
             self._pi.i2c_write_device(self._i2c_device, struct.pack(">B", addr))
             data = self._pi.i2c_read_byte(self._i2c_device)
-            print(f"data={data:x}")
+            self._logger.info(f"data={data:x}", no_prefix=True)
         else:
             (bytes, data) = self._pi.i2c_read_i2c_block_data(self._i2c_device, addr, count)
             if bytes < 0:
                 raise RuntimeError("Got error while reading")
-            print(f"data={[hex(i) for i in data] if data else None}")
+            self._logger.info(f"data={[hex(i) for i in data] if data else None}", no_prefix=True)
         return data
 
 
-class CO2MeterWrapper:
+class CO2Meter:
+    '''CO2 Meter class that controls device via I2C interface'''
     SW_RESET_ADDR = 0xFF
     SW_RESET_VAL = b"\x11\xE5\x72\x8A"
 
@@ -106,45 +142,46 @@ class CO2MeterWrapper:
     ERROR_ID_REG_HEATER_FAULT_FIELD = (4,4)
     ERROR_ID_REG_HEATER_SUPPLY_FIELD = (5,5)
 
-    def __init__(self, i2c) -> None:
+    def __init__(self, i2c, logger: Logger) -> None:
         self._i2c = i2c
+        self._logger = logger
         self.reset()
 
     def reset(self) -> None:
         '''SW reset'''
-        print(f"co2: SW RST")
+        self._logger.info(f"co2: SW RST")
         self._i2c.write(self.SW_RESET_ADDR, self.SW_RESET_VAL)
         time.sleep(0.5)
 
     def check_devid(self) -> bool:
         res = self._i2c.read(self.HW_ID_ADDR)
-        print(f"co2: Expected HW_ID={self.HW_ID_VAL}, received HW_ID={res}")
+        self._logger.info(f"co2: Expected HW_ID={self.HW_ID_VAL}, received HW_ID={res}")
         return res == self.HW_ID_VAL
 
     def read_status(self) -> int:
         '''Returns status register value'''
         res = self._i2c.read(self.STATUS_ADDR)
-        fw_mode = CO2MeterWrapper.get_field(res, self.STATUS_REG_FW_MODE_FIELD)
-        app_valid = CO2MeterWrapper.get_field(res, self.STATUS_REG_APP_VALID_FIELD)
-        data_ready = CO2MeterWrapper.get_field(res, self.STATUS_REG_DATA_READY_FIELD)
-        error = CO2MeterWrapper.get_field(res, self.STATUS_REG_ERROR_FIELD)
-        print(f"co2: FW_MODE={fw_mode:x}, APP_VALID={app_valid:x}, DATA_READY={data_ready:x}, ERROR={error:x}")
+        fw_mode = CO2Meter.get_field(res, self.STATUS_REG_FW_MODE_FIELD)
+        app_valid = CO2Meter.get_field(res, self.STATUS_REG_APP_VALID_FIELD)
+        data_ready = CO2Meter.get_field(res, self.STATUS_REG_DATA_READY_FIELD)
+        error = CO2Meter.get_field(res, self.STATUS_REG_ERROR_FIELD)
+        self._logger.info(f"co2: FW_MODE={fw_mode:x}, APP_VALID={app_valid:x}, DATA_READY={data_ready:x}, ERROR={error:x}")
         return res
 
     def check_errid(self) -> bool:
         res = self._i2c.read(self.ERROR_ID_ADDR)
         err_fields = [
-            ("write_reg_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_WRITE_REG_INVALID_FIELD)),
-            ("read_reg_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_READ_REG_INVALID_FIELD)),
-            ("measmode_invalid", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_MEASMODE_INVALID_FIELD)),
-            ("max_resistance", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_MAX_RESISTANCE_FIELD)),
-            ("heater_fault", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_HEATER_FAULT_FIELD)),
-            ("heater_supply", CO2MeterWrapper.get_field(res, self.ERROR_ID_REG_HEATER_SUPPLY_FIELD)),
+            ("write_reg_invalid", CO2Meter.get_field(res, self.ERROR_ID_REG_WRITE_REG_INVALID_FIELD)),
+            ("read_reg_invalid", CO2Meter.get_field(res, self.ERROR_ID_REG_READ_REG_INVALID_FIELD)),
+            ("measmode_invalid", CO2Meter.get_field(res, self.ERROR_ID_REG_MEASMODE_INVALID_FIELD)),
+            ("max_resistance", CO2Meter.get_field(res, self.ERROR_ID_REG_MAX_RESISTANCE_FIELD)),
+            ("heater_fault", CO2Meter.get_field(res, self.ERROR_ID_REG_HEATER_FAULT_FIELD)),
+            ("heater_supply", CO2Meter.get_field(res, self.ERROR_ID_REG_HEATER_SUPPLY_FIELD)),
         ]
-        print("co2:", end="")
+        self._logger.info("co2:", end="")
         for name, val in err_fields:
-            print(f" {name}={val};", end="")
-        print()
+            self._logger.info(f" {name}={val};", no_prefix=True, end="")
+        self._logger.info()
         return res == 0
 
     def set_app_mode(self):
@@ -155,8 +192,8 @@ class CO2MeterWrapper:
     def setmeas_mode(self, mode: int):
         '''Writes measurement mode to register'''
         meas_mode_regval = self._i2c.read(self.MEAS_MODE_ADDR)
-        meas_mode_regval = CO2MeterWrapper.set_field(meas_mode_regval, self.MEAS_MODE_REG_DRIVE_MODE_FIELD, mode)
-        print(f"co2: MEAS_MODE={mode:x}")
+        meas_mode_regval = CO2Meter.set_field(meas_mode_regval, self.MEAS_MODE_REG_DRIVE_MODE_FIELD, mode)
+        self._logger.info(f"co2: MEAS_MODE={mode:x}")
         # send byte to reg MEAS_MODE_ADDR
         self._i2c.write(self.MEAS_MODE_ADDR, struct.pack(">B", meas_mode_regval))
         time.sleep(0.5)
@@ -190,7 +227,7 @@ if __name__ == "__main__":
     import pigpio
     
     GPIO.setmode(GPIO.BCM)
-    status_led = PinWrapper(26)
+    status_led = OutPinWrapper(26)
 
     i2c_device = None
 
@@ -198,9 +235,9 @@ if __name__ == "__main__":
         status_led.value = 1
         pi = pigpio.pi()
         i2c_device = pi.i2c_open(1, 0x5a)
-        i2c = I2CWrapper(pi, i2c_device)
+        i2c = I2cDriver(pi, i2c_device, logger=Logger("i2c"))
 
-        meter = CO2MeterWrapper(i2c)
+        meter = CO2Meter(i2c, logger=Logger("co2"))
 
         meter.check_devid()
         meter.read_status()
